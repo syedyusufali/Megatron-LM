@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 import time
+import numpy as np
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -123,6 +124,47 @@ class SimpleGPT(nn.Module):
         return logits, loss
 
 
+class MegatronDataset(Dataset):
+    """Load preprocessed Megatron binary data."""
+    def __init__(self, data_path, seq_length):
+        self.seq_length = seq_length
+
+        # Load the binary data
+        bin_path = data_path + ".bin"
+        idx_path = data_path + ".idx"
+
+        if os.path.exists(bin_path):
+            print(f"Loading data from {bin_path}")
+            # Memory-map the file for efficiency
+            self.data = np.memmap(bin_path, dtype=np.uint16, mode='r')
+            self.num_tokens = len(self.data)
+            print(f"Loaded {self.num_tokens:,} tokens ({self.num_tokens/1e6:.1f}M)")
+        else:
+            print(f"Data file not found: {bin_path}")
+            print("Using random data instead...")
+            self.data = None
+            self.num_tokens = 10_000_000  # 10M fake tokens
+
+    def __len__(self):
+        return (self.num_tokens - 1) // self.seq_length
+
+    def __getitem__(self, idx):
+        if self.data is not None:
+            start = idx * self.seq_length
+            end = start + self.seq_length + 1
+            if end > len(self.data):
+                start = 0
+                end = self.seq_length + 1
+            chunk = torch.from_numpy(self.data[start:end].astype(np.int64))
+        else:
+            # Random fallback
+            chunk = torch.randint(0, 50257, (self.seq_length + 1,))
+
+        x = chunk[:-1]
+        y = chunk[1:]
+        return x, y
+
+
 class RandomDataset(Dataset):
     """Random token dataset for demonstration."""
     def __init__(self, vocab_size, seq_length, num_samples):
@@ -142,7 +184,7 @@ class RandomDataset(Dataset):
 
 def train():
     print("=" * 60)
-    print("Simple GPT Training (No Distributed)")
+    print("Simple GPT Training on WikiText-103")
     print("=" * 60)
 
     # Check GPU
@@ -155,8 +197,9 @@ def train():
     # Config
     config = SimpleGPTConfig()
     batch_size = 8
-    num_iters = 100
-    lr = 1e-4
+    num_iters = 1000  # Longer training
+    lr = 3e-4
+    warmup_iters = 100
 
     print(f"\nConfig:")
     print(f"  Layers: {config.num_layers}")
@@ -165,6 +208,7 @@ def train():
     print(f"  Seq Length: {config.seq_length}")
     print(f"  Batch Size: {batch_size}")
     print(f"  Iterations: {num_iters}")
+    print(f"  Learning Rate: {lr}")
 
     # Model
     print("\nCreating model...")
@@ -174,9 +218,20 @@ def train():
     # Optimizer
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
 
-    # Data
-    dataset = RandomDataset(config.vocab_size, config.seq_length, 10000)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    # Learning rate scheduler with warmup
+    def get_lr(it):
+        if it < warmup_iters:
+            return lr * it / warmup_iters
+        # Cosine decay
+        decay_ratio = (it - warmup_iters) / (num_iters - warmup_iters)
+        coeff = 0.5 * (1.0 + np.cos(np.pi * decay_ratio))
+        return lr * 0.1 + coeff * (lr - lr * 0.1)
+
+    # Data - try to load real data, fallback to random
+    data_path = "data/processed/wikitext103_train_text_document"
+    print(f"\nLoading dataset...")
+    dataset = MegatronDataset(data_path, config.seq_length)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
     # Training
     print("\n" + "-" * 60)
@@ -185,10 +240,13 @@ def train():
 
     model.train()
     total_loss = 0.0
+    best_loss = float('inf')
     start_time = time.time()
+    tokens_processed = 0
 
     data_iter = iter(dataloader)
     for i in range(1, num_iters + 1):
+        # Get batch
         try:
             x, y = next(data_iter)
         except StopIteration:
@@ -197,22 +255,51 @@ def train():
 
         x, y = x.to(device), y.to(device)
 
+        # Update learning rate
+        current_lr = get_lr(i)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
+        # Forward pass
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             logits, loss = model(x, y)
 
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         total_loss += loss.item()
+        tokens_processed += batch_size * config.seq_length
 
-        if i % 10 == 0:
-            avg_loss = total_loss / 10
+        # Logging
+        if i % 50 == 0:
+            avg_loss = total_loss / 50
             elapsed = time.time() - start_time
-            tokens_per_sec = (i * batch_size * config.seq_length) / elapsed
-            print(f"Iter {i:4d} | Loss: {avg_loss:.4f} | {tokens_per_sec:.0f} tok/s")
+            tokens_per_sec = tokens_processed / elapsed
+
+            # Perplexity
+            ppl = np.exp(avg_loss) if avg_loss < 20 else float('inf')
+
+            print(f"Iter {i:5d} | Loss: {avg_loss:.4f} | PPL: {ppl:8.2f} | LR: {current_lr:.2e} | {tokens_per_sec:,.0f} tok/s")
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+
             total_loss = 0.0
+
+        # Save checkpoint periodically
+        if i % 500 == 0:
+            os.makedirs("checkpoints/simple-gpt", exist_ok=True)
+            torch.save({
+                'iteration': i,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss if 'avg_loss' in dir() else 0,
+                'config': vars(config),
+            }, f"checkpoints/simple-gpt/model_iter{i}.pt")
+            print(f"  >> Checkpoint saved: checkpoints/simple-gpt/model_iter{i}.pt")
 
     # Final stats
     total_time = time.time() - start_time
@@ -220,17 +307,22 @@ def train():
 
     print("-" * 60)
     print(f"Training complete!")
-    print(f"Total time: {total_time:.1f}s")
-    print(f"Average throughput: {total_tokens / total_time:.0f} tokens/sec")
+    print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print(f"Total tokens: {total_tokens:,}")
+    print(f"Average throughput: {total_tokens / total_time:,.0f} tokens/sec")
+    print(f"Best loss: {best_loss:.4f}")
     print("-" * 60)
 
-    # Save checkpoint
+    # Final save
     os.makedirs("checkpoints/simple-gpt", exist_ok=True)
     torch.save({
+        'iteration': num_iters,
         'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': best_loss,
         'config': vars(config),
-    }, "checkpoints/simple-gpt/model.pt")
-    print(f"\nCheckpoint saved to checkpoints/simple-gpt/model.pt")
+    }, "checkpoints/simple-gpt/model_final.pt")
+    print(f"\nFinal checkpoint saved to checkpoints/simple-gpt/model_final.pt")
 
 
 if __name__ == "__main__":
