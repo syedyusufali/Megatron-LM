@@ -20,9 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class SimpleGPTConfig:
     vocab_size: int = 50304  # GPT-2 vocab padded to multiple of 64
-    hidden_size: int = 512
-    num_layers: int = 6
-    num_heads: int = 8
+    hidden_size: int = 768   # GPT-2 small size
+    num_layers: int = 12     # 12 layers like GPT-2
+    num_heads: int = 12      # 12 attention heads
     seq_length: int = 512
     dropout: float = 0.0
 
@@ -196,10 +196,10 @@ def train():
 
     # Config
     config = SimpleGPTConfig()
-    batch_size = 8
-    num_iters = 1000  # Longer training
+    batch_size = 4       # Reduced for bigger model
+    num_iters = 2000     # More iterations for bigger model
     lr = 3e-4
-    warmup_iters = 100
+    warmup_iters = 200
 
     print(f"\nConfig:")
     print(f"  Layers: {config.num_layers}")
